@@ -6,6 +6,7 @@ package repository
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/restic/restic/internal/backend"
@@ -50,23 +51,33 @@ type PruneRemovalStats struct {
 // purely to obtain a date for reporting; any other error is handled exactly
 // as when skipObjectLocked is false. locker is unused (and may be nil) when
 // skipObjectLocked is false.
+//
+// ParallelRemove runs its report callback from up to repo.Connections()
+// goroutines concurrently, so every mutation of the shared *stats is guarded
+// by mu -- without it, concurrent "stats.Removed++"/append calls race and
+// silently lose updates (observed as an under-reported "removed" count).
 func deleteUnusedPacks(ctx context.Context, repo restic.RemoverUnpacked[restic.FileType], fileList restic.IDSet, skipObjectLocked bool, locker backend.ObjectLocker, stats *PruneRemovalStats, printer progress.Printer) {
 	bar := printer.NewCounter("files deleted")
 	defer bar.Done()
 
 	stats.SelectedForRemoval += uint(len(fileList))
 
+	var mu sync.Mutex
 	_ = restic.ParallelRemove(ctx, repo, fileList, restic.PackFile, func(id restic.ID, err error) error {
 		switch {
 		case err == nil:
+			mu.Lock()
 			stats.Removed++
+			mu.Unlock()
 			printer.VV("removed %v/%v", restic.PackFile, id)
 		case skipObjectLocked && errors.Is(err, backend.ErrObjectLocked):
 			retainUntil, _, lookupErr := locker.RetainedUntil(ctx, backend.Handle{Type: restic.PackFile, Name: id.String()})
 			if lookupErr != nil {
 				printer.E("unable to determine retention for object-locked %v/%v: %v\n", restic.PackFile, id, lookupErr)
 			}
+			mu.Lock()
 			stats.ObjectLocked = append(stats.ObjectLocked, ObjectLockedPack{ID: id, RetainUntil: retainUntil})
+			mu.Unlock()
 			printer.VV("%v/%v is still object-locked, skipping\n", restic.PackFile, id)
 		default:
 			printer.E("unable to remove %v/%v from the repository", restic.PackFile, id)

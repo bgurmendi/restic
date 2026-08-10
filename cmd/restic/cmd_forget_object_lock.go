@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/restic/restic/internal/backend"
@@ -51,25 +52,38 @@ type ForgetRemovalStats struct {
 // before this function existed.
 //
 // locker is unused (and may be nil) when skipObjectLocked is false.
+//
+// ParallelRemove runs its report callback from up to repo.Connections()
+// goroutines concurrently, so every mutation of the shared stats/failedSnIDs
+// is guarded by mu -- without it, concurrent "stats.Removed++"/append/Insert
+// calls race (IDSet.Insert is a plain, non-thread-safe map write) and can
+// silently lose updates or crash with "concurrent map writes".
 func removeForgetSnapshots(ctx context.Context, repo restic.RemoverUnpacked[restic.WriteableFileType], removeSnIDs restic.IDSet, skipObjectLocked bool, locker backend.ObjectLocker, printer progress.Printer, bar restic.Counter) (ForgetRemovalStats, restic.IDSet, error) {
 	stats := ForgetRemovalStats{SelectedForRemoval: len(removeSnIDs)}
 	failedSnIDs := restic.NewIDSet()
 
+	var mu sync.Mutex
 	err := restic.ParallelRemove(ctx, repo, removeSnIDs, restic.WriteableSnapshotFile, func(id restic.ID, err error) error {
 		switch {
 		case err == nil:
+			mu.Lock()
 			stats.Removed++
+			mu.Unlock()
 			printer.VV("removed %v/%v\n", restic.SnapshotFile, id)
 		case skipObjectLocked && errors.Is(err, backend.ErrObjectLocked):
 			retainUntil, _, lookupErr := locker.RetainedUntil(ctx, backend.Handle{Type: restic.SnapshotFile, Name: id.String()})
 			if lookupErr != nil {
 				printer.E("unable to determine retention for object-locked %v/%v: %v\n", restic.SnapshotFile, id, lookupErr)
 			}
+			mu.Lock()
 			stats.ObjectLocked = append(stats.ObjectLocked, ObjectLockedSnapshot{ID: id, RetainUntil: retainUntil})
+			mu.Unlock()
 			printer.VV("%v/%v is still object-locked, skipping\n", restic.SnapshotFile, id)
 		default:
 			printer.E("unable to remove %v/%v from the repository\n", restic.SnapshotFile, id)
+			mu.Lock()
 			failedSnIDs.Insert(id)
+			mu.Unlock()
 		}
 		return nil
 	}, bar)
