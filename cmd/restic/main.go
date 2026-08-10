@@ -91,6 +91,7 @@ The full documentation can be found at https://restic.readthedocs.io/ .
 		newLsCommand(globalOptions),
 		newMigrateCommand(globalOptions),
 		newOptionsCommand(globalOptions),
+		newProtectCommand(globalOptions),
 		newPruneCommand(globalOptions),
 		newRebuildIndexCommand(globalOptions),
 		newRecoverCommand(globalOptions),
