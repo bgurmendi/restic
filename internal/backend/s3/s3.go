@@ -257,6 +257,17 @@ func (be *s3) IsPermanentError(err error) bool {
 		}
 	}
 
+	// A locked-delete failure (see removeObjectLockAware) will keep failing
+	// with the exact same error until the object's retention period expires
+	// -- which is typically days to years away, never something a retry
+	// backoff (capped at minutes) could bridge. Treating it as permanent
+	// lets it surface immediately to the caller (e.g. forget's
+	// --skip-object-locked classification) instead of being retried for the
+	// backend's full MaxElapsedTime on every single locked object.
+	if errors.Is(err, backend.ErrObjectLocked) {
+		return true
+	}
+
 	return false
 }
 
@@ -375,8 +386,19 @@ func (be *s3) Stat(ctx context.Context, h backend.Handle) (bi backend.FileInfo, 
 }
 
 // Remove removes the blob with the given name and type.
+//
+// When the `object-lock` feature flag is enabled, this delegates to
+// removeObjectLockAware (objectlock.go), which targets the object's actual
+// current version explicitly and classifies a locked-object delete failure
+// with backend.ErrObjectLocked. See that function's comment for why a
+// version-less delete -- the one made below -- can never observe a lock at
+// all once Object Lock is in play.
 func (be *s3) Remove(ctx context.Context, h backend.Handle) error {
 	objName := be.Filename(h)
+
+	if feature.Flag.Enabled(feature.ObjectLock) {
+		return be.removeObjectLockAware(ctx, objName)
+	}
 
 	err := be.client.RemoveObject(ctx, be.cfg.Bucket, objName, minio.RemoveObjectOptions{})
 

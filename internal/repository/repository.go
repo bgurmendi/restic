@@ -671,6 +671,14 @@ func (r *Repository) Connections() uint {
 	return r.be.Properties().Connections
 }
 
+// Backend returns the repository's underlying backend. Most callers should
+// prefer the higher-level Repository methods; this exists for callers that
+// need a backend-specific capability Repository itself does not expose, e.g.
+// backend.AsObjectLocker for the `protect` command.
+func (r *Repository) Backend() backend.Backend {
+	return r.be
+}
+
 func (r *Repository) LookupBlob(bh restic.BlobHandle) []restic.PackBlob {
 	entries := r.idx.Lookup(bh)
 	out := make([]restic.PackBlob, len(entries))
