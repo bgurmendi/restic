@@ -1,0 +1,14 @@
+Enhancement: Add experimental `restic protect` command and `--skip-object-locked` for `forget`/`prune`
+
+Backups stored on S3-compatible storage could previously still be deleted by
+anyone holding delete-capable credentials, even when a retention policy meant
+to keep them. Restic now has experimental support for S3 Object Lock on the
+`s3` backend. The new `restic protect --keep-* --for <duration>` command
+extends Object Lock retention on the snapshots a retention policy currently
+wants to keep, and on the data they need. `forget` and `prune` gained a
+`--skip-object-locked` flag to skip snapshots and packs that are still
+locked instead of failing the whole run. This requires an S3 bucket created
+with Object Lock enabled and the `object-lock` experimental feature flag
+(`RESTIC_FEATURES=object-lock`).
+
+https://github.com/restic/restic/pull/00000

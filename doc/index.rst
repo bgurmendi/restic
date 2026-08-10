@@ -19,6 +19,7 @@ Restic Documentation
    090_participating
    100_references
    110_talks
+   120_object_lock
    faq
    manual_rest
    developer_information
