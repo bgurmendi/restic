@@ -88,8 +88,10 @@ func testRunForgetJSON(t testing.TB, gopts global.Options, args ...string) {
 	buf, err := withCaptureStdout(t, gopts, func(ctx context.Context, gopts global.Options) error {
 		gopts.JSON = true
 		opts := ForgetOptions{
+			PolicySelectionOptions: PolicySelectionOptions{
+				Last: 1,
+			},
 			DryRun: true,
-			Last:   1,
 		}
 		pruneOpts := PruneOptions{
 			MaxUnused: "5%",

@@ -39,8 +39,10 @@ func TestRunForgetSafetyNet(t *testing.T) {
 
 	// --keep-tags invalid
 	err := testRunForgetMayFail(t, env.gopts, ForgetOptions{
-		KeepTags: data.TagLists{data.TagList{"invalid"}},
-		GroupBy:  data.SnapshotGroupByOptions{Host: true, Path: true},
+		PolicySelectionOptions: PolicySelectionOptions{
+			KeepTags: data.TagLists{data.TagList{"invalid"}},
+		},
+		GroupBy: data.SnapshotGroupByOptions{Host: true, Path: true},
 	})
 	rtest.Assert(t, strings.Contains(err.Error(), `refusing to delete last snapshot of snapshot group "host example, path`), "wrong error message got %v", err)
 

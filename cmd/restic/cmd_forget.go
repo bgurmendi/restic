@@ -7,8 +7,10 @@ import (
 	"io"
 	"strconv"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui"
@@ -100,19 +102,7 @@ func (c *ForgetPolicyCount) Type() string {
 
 // ForgetOptions collects all options for the forget command.
 type ForgetOptions struct {
-	Last          ForgetPolicyCount
-	Hourly        ForgetPolicyCount
-	Daily         ForgetPolicyCount
-	Weekly        ForgetPolicyCount
-	Monthly       ForgetPolicyCount
-	Yearly        ForgetPolicyCount
-	Within        data.Duration
-	WithinHourly  data.Duration
-	WithinDaily   data.Duration
-	WithinWeekly  data.Duration
-	WithinMonthly data.Duration
-	WithinYearly  data.Duration
-	KeepTags      data.TagLists
+	PolicySelectionOptions
 
 	UnsafeAllowRemoveAll bool
 
@@ -123,22 +113,15 @@ type ForgetOptions struct {
 	GroupBy data.SnapshotGroupByOptions
 	DryRun  bool
 	Prune   bool
+
+	// SkipObjectLocked skips snapshot files still under an active Object
+	// Lock retention instead of failing the whole run (experimental,
+	// requires the object-lock feature flag).
+	SkipObjectLocked bool
 }
 
 func (opts *ForgetOptions) AddFlags(f *pflag.FlagSet) {
-	f.VarP(&opts.Last, "keep-last", "l", "keep the last `n` snapshots (use 'unlimited' to keep all snapshots)")
-	f.VarP(&opts.Hourly, "keep-hourly", "H", "keep the last `n` hourly snapshots (use 'unlimited' to keep all hourly snapshots)")
-	f.VarP(&opts.Daily, "keep-daily", "d", "keep the last `n` daily snapshots (use 'unlimited' to keep all daily snapshots)")
-	f.VarP(&opts.Weekly, "keep-weekly", "w", "keep the last `n` weekly snapshots (use 'unlimited' to keep all weekly snapshots)")
-	f.VarP(&opts.Monthly, "keep-monthly", "m", "keep the last `n` monthly snapshots (use 'unlimited' to keep all monthly snapshots)")
-	f.VarP(&opts.Yearly, "keep-yearly", "y", "keep the last `n` yearly snapshots (use 'unlimited' to keep all yearly snapshots)")
-	f.VarP(&opts.Within, "keep-within", "", "keep snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
-	f.VarP(&opts.WithinHourly, "keep-within-hourly", "", "keep hourly snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
-	f.VarP(&opts.WithinDaily, "keep-within-daily", "", "keep daily snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
-	f.VarP(&opts.WithinWeekly, "keep-within-weekly", "", "keep weekly snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
-	f.VarP(&opts.WithinMonthly, "keep-within-monthly", "", "keep monthly snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
-	f.VarP(&opts.WithinYearly, "keep-within-yearly", "", "keep yearly snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
-	f.Var(&opts.KeepTags, "keep-tag", "keep snapshots with this `taglist` (can be specified multiple times)")
+	opts.PolicySelectionOptions.AddFlags(f)
 	f.BoolVar(&opts.UnsafeAllowRemoveAll, "unsafe-allow-remove-all", false, "allow deleting all snapshots of a snapshot group")
 
 	f.StringArrayVar(&opts.Hosts, "hostname", nil, "only consider snapshots with the given `hostname` (can be specified multiple times)")
@@ -155,24 +138,16 @@ func (opts *ForgetOptions) AddFlags(f *pflag.FlagSet) {
 	f.VarP(&opts.GroupBy, "group-by", "g", "`group` snapshots by host, paths and/or tags, separated by comma (disable grouping with '')")
 	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "do not delete anything, just print what would be done")
 	f.BoolVar(&opts.Prune, "prune", false, "automatically run the 'prune' command if snapshots have been removed")
+	f.BoolVar(&opts.SkipObjectLocked, "skip-object-locked", false, "skip snapshot files still under an active Object Lock retention instead of failing (experimental, requires the object-lock feature flag)")
 
 	f.SortFlags = false
 }
 
 func verifyForgetOptions(opts *ForgetOptions) error {
-	if opts.Last < -1 || opts.Hourly < -1 || opts.Daily < -1 || opts.Weekly < -1 ||
-		opts.Monthly < -1 || opts.Yearly < -1 {
-		return errors.Fatal("negative values other than -1 are not allowed for --keep-*")
+	if opts.SkipObjectLocked && !feature.Flag.Enabled(feature.ObjectLock) {
+		return errors.Fatal("feature flag `object-lock` is required to use `--skip-object-locked`, enable it by setting RESTIC_FEATURES=object-lock")
 	}
-
-	for _, d := range []data.Duration{opts.Within, opts.WithinHourly, opts.WithinDaily,
-		opts.WithinMonthly, opts.WithinWeekly, opts.WithinYearly} {
-		if d.Hours < 0 || d.Days < 0 || d.Months < 0 || d.Years < 0 {
-			return errors.Fatal("durations containing negative values are not allowed for --keep-within*")
-		}
-	}
-
-	return nil
+	return verifyPolicySelectionOptions(&opts.PolicySelectionOptions)
 }
 
 func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOptions, gopts global.Options, term ui.Terminal, args []string) error {
@@ -197,6 +172,19 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 	}
 	defer unlock()
 
+	// Resolve the backend.ObjectLocker capability once, upfront, rather than
+	// per-file: --skip-object-locked needs it (lazily, see
+	// removeForgetSnapshots) only for the rare locked case, but a backend
+	// that doesn't support it at all must fail clearly now, not silently
+	// ignore the flag partway through the removal loop.
+	var locker backend.ObjectLocker
+	if opts.SkipObjectLocked {
+		locker, err = requireObjectLocker(repo.Backend(), "forget")
+		if err != nil {
+			return err
+		}
+	}
+
 	var snapshots data.Snapshots
 	removeSnIDs := restic.NewIDSet()
 
@@ -215,26 +203,7 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 			removeSnIDs.Insert(*sn.ID())
 		}
 	} else {
-		snapshotGroups, _, err := data.GroupSnapshots(snapshots, opts.GroupBy)
-		if err != nil {
-			return err
-		}
-
-		policy := data.ExpirePolicy{
-			Last:          int(opts.Last),
-			Hourly:        int(opts.Hourly),
-			Daily:         int(opts.Daily),
-			Weekly:        int(opts.Weekly),
-			Monthly:       int(opts.Monthly),
-			Yearly:        int(opts.Yearly),
-			Within:        opts.Within,
-			WithinHourly:  opts.WithinHourly,
-			WithinDaily:   opts.WithinDaily,
-			WithinWeekly:  opts.WithinWeekly,
-			WithinMonthly: opts.WithinMonthly,
-			WithinYearly:  opts.WithinYearly,
-			Tags:          opts.KeepTags,
-		}
+		policy := opts.Policy()
 
 		if policy.Empty() {
 			if opts.UnsafeAllowRemoveAll {
@@ -249,29 +218,31 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 
 		printer.P("Applying Policy: %v\n", policy)
 
-		for k, snapshotGroup := range snapshotGroups {
+		selections, err := selectSnapshotsForPolicy(snapshots, opts.GroupBy, policy)
+		if err != nil {
+			return err
+		}
+
+		for _, selection := range selections {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 
 			if gopts.Verbose >= 1 && !gopts.JSON {
-				err = PrintSnapshotGroupHeader(gopts.Term.OutputWriter(), k)
+				err = PrintSnapshotGroupHeader(gopts.Term.OutputWriter(), selection.GroupKeyJSON)
 				if err != nil {
 					return err
 				}
 			}
 
-			var key data.SnapshotGroupKey
-			if json.Unmarshal([]byte(k), &key) != nil {
-				return err
-			}
+			key := selection.Key
 
 			var fg ForgetGroup
 			fg.Tags = key.Tags
 			fg.Host = key.Hostname
 			fg.Paths = key.Paths
 
-			keep, remove, reasons := data.ApplyPolicy(snapshotGroup, policy)
+			keep, remove, reasons := selection.Keep, selection.Remove, selection.Reasons
 
 			if !policy.Empty() && len(keep) == 0 {
 				return fmt.Errorf("refusing to delete last snapshot of snapshot group \"%v\"", key.String())
@@ -310,29 +281,49 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 
 	// these are the snapshots that failed to be removed
 	failedSnIDs := restic.NewIDSet()
+	var removalStats ForgetRemovalStats
 	if len(removeSnIDs) > 0 {
 		if !opts.DryRun {
 			bar := printer.NewCounter("files deleted")
-			err := restic.ParallelRemove(ctx, repo, removeSnIDs, restic.WriteableSnapshotFile, func(id restic.ID, err error) error {
-				if err != nil {
-					printer.E("unable to remove %v/%v from the repository\n", restic.SnapshotFile, id)
-					failedSnIDs.Insert(id)
-				} else {
-					printer.VV("removed %v/%v\n", restic.SnapshotFile, id)
-				}
-				return nil
-			}, bar)
+			removalStats, failedSnIDs, err = removeForgetSnapshots(ctx, repo, removeSnIDs, opts.SkipObjectLocked, locker, printer, bar)
 			bar.Done()
 			if err != nil {
 				return err
 			}
 		} else {
+			removalStats.SelectedForRemoval = len(removeSnIDs)
 			printer.P("Would have removed the following snapshots:\n%v\n\n", removeSnIDs)
 		}
 	}
 
+	// removalStats.ObjectLocked is only ever non-empty when SkipObjectLocked
+	// is set (removeForgetSnapshots only classifies ErrObjectLocked that
+	// way when told to). Print the summary BASE.md documents ("selected for
+	// removal: 15 / removed: 11 / object locked: 4", one count per line) via
+	// printer.P: like the "Applying Policy" line above, P() is a no-op both
+	// under --quiet (verbosity 0) and under --json (NewTerminalPrinter forces
+	// verbosity to 0 whenever json is true), so this needs no extra
+	// !gopts.JSON guard and leaves default (non-flag) output untouched.
+	if opts.SkipObjectLocked {
+		printer.P("selected for removal: %d\n", removalStats.SelectedForRemoval)
+		printer.P("removed: %d\n", removalStats.Removed)
+		printer.P("object locked: %d\n", len(removalStats.ObjectLocked))
+	}
+
 	if gopts.JSON && len(jsonGroups) > 0 {
-		err = printJSONForget(gopts.Term.OutputWriter(), jsonGroups)
+		if opts.SkipObjectLocked {
+			// Emitting the SkipObjectLocked counts as structured fields
+			// requires wrapping the existing bare `[]*ForgetGroup` array in
+			// an object -- there is no way to add fields to a JSON array.
+			// That's only acceptable because it happens exclusively behind
+			// the opt-in --skip-object-locked flag: without the flag,
+			// printJSONForget below still emits the exact bare-array shape
+			// forget --json has always produced, so existing scripts that
+			// don't pass the new flag see byte-for-byte unchanged output.
+			err = printJSONForgetSkipObjectLocked(gopts.Term.OutputWriter(), jsonGroups, removalStats)
+		} else {
+			err = printJSONForget(gopts.Term.OutputWriter(), jsonGroups)
+		}
 		if err != nil {
 			return err
 		}
