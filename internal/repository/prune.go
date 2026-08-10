@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/repository/index"
@@ -31,6 +32,15 @@ type PruneOptions struct {
 
 	RepackCacheableOnly bool
 	RepackUncompressed  bool
+
+	// SkipObjectLocked skips unused/unreferenced pack files still under an
+	// active Object Lock retention instead of failing, leaving them in place
+	// for a future prune run instead of removing them (experimental,
+	// requires the object-lock feature flag). The backend.ObjectLocker
+	// capability check for this flag happens in the caller (cmd/restic),
+	// which also resolves the locker instance passed to Execute -- mirroring
+	// forget's --skip-object-locked (see removeForgetSnapshots).
+	SkipObjectLocked bool
 }
 
 type PruneStats struct {
@@ -592,7 +602,14 @@ func (plan *PrunePlan) Stats() PruneStats {
 // - rebuild the index while ignoring all files that will be deleted
 // - delete the files
 // plan.removePacks and plan.ignorePacks are modified in this function.
-func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) error {
+//
+// locker is only used when plan.opts.SkipObjectLocked is true (it may be nil
+// otherwise): the caller resolves the backend.ObjectLocker capability
+// upfront so an unsupported backend fails clearly before any deletion is
+// attempted, rather than silently ignoring the flag partway through.
+func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer, locker backend.ObjectLocker) (PruneRemovalStats, error) {
+	var removal PruneRemovalStats
+
 	if plan.opts.DryRun {
 		printer.V("Repeated prune dry-runs can report slightly different amounts of data to keep or repack. This is expected behavior.\n\n")
 		if len(plan.removePacksFirst) > 0 {
@@ -601,7 +618,7 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) er
 		printer.V("Would have repacked and removed the following packs:\n%v\n\n", plan.repackPacks)
 		printer.V("Would have removed the following no longer used packs:\n%v\n\n", plan.removePacks)
 		// Always quit here if DryRun was set!
-		return nil
+		return removal, nil
 	}
 
 	repo := plan.repo
@@ -611,12 +628,12 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) er
 	// unreferenced packs can be safely deleted first
 	if len(plan.removePacksFirst) != 0 {
 		printer.P("deleting unreferenced packs\n")
-		_ = deleteFiles(ctx, true, &internalRepository{repo}, plan.removePacksFirst, restic.PackFile, printer)
+		deleteUnusedPacks(ctx, &internalRepository{repo}, plan.removePacksFirst, plan.opts.SkipObjectLocked, locker, &removal, printer)
 		// forget unused data
 		plan.removePacksFirst = nil
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return removal, ctx.Err()
 	}
 
 	if len(plan.repackPacks) != 0 {
@@ -626,7 +643,7 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) er
 			return CopyBlobs(ctx, repo, repo, uploader, plan.repackPacks, plan.keepBlobs, bar, printer.P)
 		})
 		if err != nil {
-			return errors.Fatalf("%s", err)
+			return removal, errors.Fatalf("%s", err)
 		}
 
 		// Also remove repacked packs
@@ -639,7 +656,7 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) er
 				"Integrity check failed.\n"+
 				"Please report this error (along with the output of the 'prune' run) at\n"+
 				"https://github.com/restic/restic/issues/new/choose", plan.keepBlobs)
-			return errors.Fatal("internal error: blobs were not repacked")
+			return removal, errors.Fatal("internal error: blobs were not repacked")
 		}
 
 		// allow GC of the blob set
@@ -652,32 +669,43 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) er
 		plan.ignorePacks.Merge(plan.removePacks)
 	}
 
+	// indexStillObjectLocked is set below when at least one obsolete index
+	// file could not be deleted because it is still under an active Object
+	// Lock retention (see index.MasterIndex.Rewrite's docstring): the packs
+	// that index still lists must not be physically removed this run, even
+	// if the packs themselves are not locked, or the surviving old index
+	// would end up referencing packs that no longer exist.
+	indexStillObjectLocked := false
+
 	if plan.opts.UnsafeRecovery {
 		printer.P("deleting index files\n")
 		indexFiles := repo.idx.IDs()
 		err := deleteFiles(ctx, false, &internalRepository{repo}, indexFiles, restic.IndexFile, printer)
 		if err != nil {
-			return errors.Fatalf("%s", err)
+			return removal, errors.Fatalf("%s", err)
 		}
 	} else if len(plan.ignorePacks) != 0 {
-		err := rewriteIndexFiles(ctx, repo, plan.ignorePacks, nil, nil, printer)
+		var err error
+		indexStillObjectLocked, err = rewriteIndexFiles(ctx, repo, plan.ignorePacks, nil, nil, plan.opts.SkipObjectLocked, printer)
 		if err != nil {
-			return errors.Fatalf("%s", err)
+			return removal, errors.Fatalf("%s", err)
 		}
 	}
 
-	if len(plan.removePacks) != 0 {
+	if len(plan.removePacks) != 0 && indexStillObjectLocked {
+		printer.P("some old index files referencing %d pack(s) are still object-locked; leaving those packs in place until a future prune run\n", len(plan.removePacks))
+	} else if len(plan.removePacks) != 0 {
 		printer.P("removing %d old packs", len(plan.removePacks))
-		_ = deleteFiles(ctx, true, &internalRepository{repo}, plan.removePacks, restic.PackFile, printer)
+		deleteUnusedPacks(ctx, &internalRepository{repo}, plan.removePacks, plan.opts.SkipObjectLocked, locker, &removal, printer)
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return removal, ctx.Err()
 	}
 
 	if plan.opts.UnsafeRecovery {
 		err := repo.idx.SaveFallback(ctx, &internalRepository{repo}, plan.ignorePacks, printer.NewCounter("packs processed"))
 		if err != nil {
-			return errors.Fatalf("%s", err)
+			return removal, errors.Fatalf("%s", err)
 		}
 	}
 
@@ -685,7 +713,7 @@ func (plan *PrunePlan) Execute(ctx context.Context, printer progress.Printer) er
 	repo.clearIndex()
 
 	printer.P("done\n")
-	return nil
+	return removal, nil
 }
 
 // deleteFiles deletes the given fileList of fileType in parallel

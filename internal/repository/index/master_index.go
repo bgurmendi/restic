@@ -7,7 +7,9 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/repository/pack"
 	"github.com/restic/restic/internal/restic"
 	"golang.org/x/sync/errgroup"
@@ -366,6 +368,18 @@ type MasterIndexRewriteOpts struct {
 	SaveProgress   restic.Counter
 	DeleteProgress func() restic.Counter
 	DeleteReport   func(id restic.ID, err error)
+
+	// SkipObjectLocked treats a locked-delete failure (backend.ErrObjectLocked)
+	// on an obsolete index file as tolerable rather than fatal: the file is
+	// simply left in place -- superseded but harmless, since the index files
+	// just written already reflect the correct, current state -- for a
+	// future, unlocked rewrite to actually remove. This mirrors prune's own
+	// delete-and-classify handling of unused pack files
+	// (--skip-object-locked), extended to old index files: without it,
+	// renewing Object Lock retention on index/* (restic protect) would turn
+	// any routine, same-day index rewrite (triggered by forget removing a
+	// snapshot) into a hard prune failure.
+	SkipObjectLocked bool
 }
 
 // Rewrite removes packs whose ID is in excludePacks from all known indexes.
@@ -556,12 +570,17 @@ func (mi *MasterIndex) Rewrite(ctx context.Context, repo restic.Unpacked[restic.
 		p = opts.DeleteProgress()
 	}
 	defer p.Done()
-	return restic.ParallelRemove(ctx, repo, obsolete, restic.IndexFile, func(id restic.ID, err error) error {
+
+	err = restic.ParallelRemove(ctx, repo, obsolete, restic.IndexFile, func(id restic.ID, err error) error {
 		if opts.DeleteReport != nil {
 			opts.DeleteReport(id, err)
 		}
+		if err != nil && opts.SkipObjectLocked && errors.Is(err, backend.ErrObjectLocked) {
+			return nil
+		}
 		return err
 	}, p)
+	return err
 }
 
 // SaveFallback saves all known indexes to index files, leaving out any

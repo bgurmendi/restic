@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 
+	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/repository/index"
 	"github.com/restic/restic/internal/repository/pack"
 	"github.com/restic/restic/internal/restic"
@@ -93,7 +95,9 @@ func RepairIndex(ctx context.Context, repo *Repository, opts RepairIndexOptions,
 		}
 	}
 
-	err = rewriteIndexFiles(ctx, repo, removePacks, oldIndexes, obsoleteIndexes, printer)
+	// repair index has no --skip-object-locked concept of its own: any
+	// locked-delete failure it hits stays fatal, exactly as before.
+	_, err = rewriteIndexFiles(ctx, repo, removePacks, oldIndexes, obsoleteIndexes, false, printer)
 	if err != nil {
 		return err
 	}
@@ -103,21 +107,39 @@ func RepairIndex(ctx context.Context, repo *Repository, opts RepairIndexOptions,
 	return nil
 }
 
-func rewriteIndexFiles(ctx context.Context, repo *Repository, removePacks restic.IDSet, oldIndexes restic.IDSet, extraObsolete restic.IDs, printer progress.Printer) error {
+// rewriteIndexFiles rebuilds the index without removePacks and deletes the
+// now-obsolete old index files. When skipObjectLocked is true (prune's
+// --skip-object-locked, see PrunePlan.Execute), a locked-delete failure on
+// an old index file is tolerated rather than fatal: renewing Object Lock
+// retention on index/* (restic protect) locks whatever index files exist at
+// the time, so a routine, same-day rewrite triggered by forget removing a
+// snapshot must not turn into a hard prune failure just because the
+// superseded old index file is still under active retention. The returned
+// bool reports whether that happened at least once; see
+// index.MasterIndex.Rewrite's docstring for why the caller must then treat
+// removePacks as not yet safe to physically delete.
+func rewriteIndexFiles(ctx context.Context, repo *Repository, removePacks restic.IDSet, oldIndexes restic.IDSet, extraObsolete restic.IDs, skipObjectLocked bool, printer progress.Printer) (bool, error) {
 	printer.P("rebuilding index\n")
 
 	bar := printer.NewCounter("indexes processed")
-	return repo.idx.Rewrite(ctx, &internalRepository{repo}, removePacks, oldIndexes, extraObsolete, index.MasterIndexRewriteOpts{
+	var skippedObjectLocked bool
+	err := repo.idx.Rewrite(ctx, &internalRepository{repo}, removePacks, oldIndexes, extraObsolete, index.MasterIndexRewriteOpts{
 		SaveProgress: bar,
 		DeleteProgress: func() restic.Counter {
 			return printer.NewCounter("old indexes deleted")
 		},
 		DeleteReport: func(id restic.ID, err error) {
-			if err != nil {
-				printer.VV("failed to remove index %v: %v\n", id.String(), err)
-			} else {
+			switch {
+			case err == nil:
 				printer.VV("removed index %v\n", id.String())
+			case skipObjectLocked && errors.Is(err, backend.ErrObjectLocked):
+				skippedObjectLocked = true
+				printer.VV("index %v is still object-locked, skipping\n", id.String())
+			default:
+				printer.VV("failed to remove index %v: %v\n", id.String(), err)
 			}
 		},
+		SkipObjectLocked: skipObjectLocked,
 	})
+	return skippedObjectLocked, err
 }

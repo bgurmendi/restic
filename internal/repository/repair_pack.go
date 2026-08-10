@@ -56,8 +56,9 @@ func RepairPacks(ctx context.Context, repo *Repository, ids restic.IDSet, printe
 	}
 	bar.Done()
 
-	// remove salvaged packs from index
-	err = rewriteIndexFiles(ctx, repo, ids, nil, nil, printer)
+	// remove salvaged packs from index; repair packs has no --skip-object-locked
+	// concept of its own, so a locked-delete failure stays fatal, as before.
+	_, err = rewriteIndexFiles(ctx, repo, ids, nil, nil, false, printer)
 	if err != nil {
 		return err
 	}

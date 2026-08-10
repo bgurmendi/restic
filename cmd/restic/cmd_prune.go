@@ -7,9 +7,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
@@ -68,12 +70,21 @@ type PruneOptions struct {
 
 	SmallPackSize  string
 	SmallPackBytes uint64
+
+	// SkipObjectLocked skips unused packs still under an active Object Lock
+	// retention instead of failing the whole run (experimental, requires
+	// the object-lock feature flag). Deliberately not part of
+	// AddLimitedFlags: forget's `--prune` reuses that flag set on the same
+	// FlagSet as forget's own `--skip-object-locked` (cmd_forget.go), and
+	// registering a second flag of the same name there would panic.
+	SkipObjectLocked bool
 }
 
 func (opts *PruneOptions) AddFlags(f *pflag.FlagSet) {
 	opts.AddLimitedFlags(f)
 	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "do not modify the repository, just print what would be done")
 	f.StringVarP(&opts.UnsafeNoSpaceRecovery, "unsafe-recover-no-free-space", "", "", "UNSAFE, READ THE DOCUMENTATION BEFORE USING! Try to recover a repository stuck with no free space. Do not use without trying out 'prune --max-repack-size 0' first.")
+	f.BoolVar(&opts.SkipObjectLocked, "skip-object-locked", false, "skip unused packs still under an active Object Lock retention instead of failing (experimental, requires the object-lock feature flag)")
 }
 
 func (opts *PruneOptions) AddLimitedFlags(f *pflag.FlagSet) {
@@ -93,6 +104,10 @@ func (opts *PruneOptions) AddLimitedFlags(f *pflag.FlagSet) {
 }
 
 func verifyPruneOptions(opts *PruneOptions) error {
+	if opts.SkipObjectLocked && !feature.Flag.Enabled(feature.ObjectLock) {
+		return errors.Fatal("feature flag `object-lock` is required to use `--skip-object-locked`, enable it by setting RESTIC_FEATURES=object-lock")
+	}
+
 	opts.MaxRepackBytes = math.MaxUint64
 	if len(opts.MaxRepackSize) > 0 {
 		size, err := ui.ParseBytes(opts.MaxRepackSize)
@@ -198,6 +213,20 @@ func runPruneWithRepo(ctx context.Context, opts PruneOptions, gopts global.Optio
 		printer.S("warning: running prune without a cache, this may be very slow!")
 	}
 
+	// Resolve the backend.ObjectLocker capability once, upfront, rather than
+	// per-pack: --skip-object-locked needs it (lazily, see
+	// repository.PrunePlan.Execute) only for the rare locked case, but a
+	// backend that doesn't support it at all must fail clearly now, not
+	// silently ignore the flag partway through pack deletion.
+	var locker backend.ObjectLocker
+	if opts.SkipObjectLocked {
+		var err error
+		locker, err = requireObjectLocker(repo.Backend(), "prune")
+		if err != nil {
+			return err
+		}
+	}
+
 	// loading the index before the snapshots is ok, as we use an exclusive lock here
 	err := repo.LoadIndex(ctx, printer)
 	if err != nil {
@@ -214,6 +243,8 @@ func runPruneWithRepo(ctx context.Context, opts PruneOptions, gopts global.Optio
 
 		RepackCacheableOnly: opts.RepackCacheableOnly,
 		RepackUncompressed:  opts.RepackUncompressed,
+
+		SkipObjectLocked: opts.SkipObjectLocked,
 	}
 
 	plan, err := repository.PlanPrune(ctx, popts, repo, func(ctx context.Context, repo restic.Repository, usedBlobs restic.FindBlobSet) error {
@@ -242,7 +273,29 @@ func runPruneWithRepo(ctx context.Context, opts PruneOptions, gopts global.Optio
 	// Trigger GC to reset garbage collection threshold
 	runtime.GC()
 
-	return plan.Execute(ctx, printer)
+	// removalStats records the actual delete-time outcome of pack removal
+	// (as opposed to plan.Stats()'s pre-computed plan, printed above before
+	// any deletion is attempted). ObjectLocked is only ever non-empty when
+	// SkipObjectLocked is set (deleteUnusedPacks only classifies
+	// ErrObjectLocked that way when told to).
+	removalStats, err := plan.Execute(ctx, printer, locker)
+	if err != nil {
+		return err
+	}
+
+	// Print the summary BASE.md documents for prune ("unused packs: 93 /
+	// removed: 74 / object locked: 19", one count per line) via printer.P:
+	// like printPruneStats above, P() is a no-op both under --quiet
+	// (verbosity 0) and under --json (NewTerminalPrinter forces verbosity to
+	// 0 whenever json is true), so this needs no extra !gopts.JSON guard and
+	// leaves default (non-flag) output byte-for-byte unchanged.
+	if opts.SkipObjectLocked {
+		printer.P("\nunused packs: %d\n", removalStats.SelectedForRemoval)
+		printer.P("removed: %d\n", removalStats.Removed)
+		printer.P("object locked: %d\n", len(removalStats.ObjectLocked))
+	}
+
+	return nil
 }
 
 // printPruneStats prints out the statistics

@@ -44,7 +44,8 @@ func testPrune(t *testing.T, opts repository.PruneOptions, errOnUnused bool) {
 	}, progress.NewNoopPrinter())
 	rtest.OK(t, err)
 
-	rtest.OK(t, plan.Execute(context.TODO(), progress.NewNoopPrinter()))
+	_, err = plan.Execute(context.TODO(), progress.NewNoopPrinter(), nil)
+	rtest.OK(t, err)
 
 	repo = repository.TestOpenBackend(t, be)
 	repository.TestCheckRepo(t, repo)
@@ -167,7 +168,8 @@ func TestPruneSmall(t *testing.T) {
 		return nil
 	}, progress.NewNoopPrinter())
 	rtest.OK(t, err)
-	rtest.OK(t, plan.Execute(context.TODO(), progress.NewNoopPrinter()))
+	_, err = plan.Execute(context.TODO(), progress.NewNoopPrinter(), nil)
+	rtest.OK(t, err)
 
 	stats := plan.Stats()
 	rtest.Equals(t, stats.Size.Used/blobSize, uint64(numBlobsCreated), fmt.Sprintf("total size of blobs should be %d but is %d",
